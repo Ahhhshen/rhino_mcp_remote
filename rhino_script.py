@@ -20,6 +20,8 @@ from System.Drawing import Bitmap
 from System.Drawing.Imaging import ImageFormat
 from System.IO import MemoryStream
 from datetime import datetime
+import websockets
+import asyncio
 
 # Configuration
 HOST = 'localhost'
@@ -86,7 +88,7 @@ class RhinoMCPServer:
         self.host = host
         self.port = port
         self.running = False
-        self.socket = None
+        self.server = None
         self.server_thread = None
     
     def start(self):
@@ -97,12 +99,6 @@ class RhinoMCPServer:
         self.running = True
         
         try:
-            # Create socket
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind((self.host, self.port))
-            self.socket.listen(1)
-            
             # Start server thread
             self.server_thread = threading.Thread(target=self._server_loop)
             self.server_thread.daemon = True
@@ -116,13 +112,13 @@ class RhinoMCPServer:
     def stop(self):
         self.running = False
         
-        # Close socket
-        if self.socket:
+        # Close server
+        if self.server:
             try:
-                self.socket.close()
+                asyncio.run(self.server.close())
             except:
                 pass
-            self.socket = None
+            self.server = None
         
         # Wait for thread to finish
         if self.server_thread:
@@ -136,99 +132,46 @@ class RhinoMCPServer:
         log_message("RhinoMCP server stopped")
     
     def _server_loop(self):
-        """Main server loop that accepts connections"""
-        while self.running:
+        """Main server loop that accepts WebSocket connections"""
+        async def handle_client(websocket, path):
             try:
-                client, addr = self.socket.accept()
-                log_message("Client connected from {0}:{1}".format(addr[0], addr[1]))
-                
-                # Handle client in a new thread
-                client_thread = threading.Thread(target=self._handle_client, args=(client,))
-                client_thread.daemon = True
-                client_thread.start()
-                
-            except Exception as e:
-                if self.running:
-                    log_message("Error accepting connection: {0}".format(str(e)))
-                    time.sleep(0.5)
-    
-    def _handle_client(self, client):
-        """Handle a client connection"""
-        try:
-            # Set socket buffer size
-            client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 14485760)  # 10MB
-            client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 14485760)  # 10MB
-            
-            while self.running:
-                # Receive command with larger buffer
-                data = client.recv(14485760)  # 10MB buffer
-                if not data:
-                    log_message("Client disconnected")
-                    break
-                    
-                try:
-                    command = json.loads(data.decode('utf-8'))
-                    log_message("Received command: {0}".format(command))
-                    
-                    # Create a closure to capture the client connection
-                    def execute_wrapper():
-                        try:
-                            response = self.execute_command(command)
-                            response_json = json.dumps(response)
-                            # Split large responses into chunks if needed
-                            chunk_size = 14485760  # 10MB chunks
-                            response_bytes = response_json.encode('utf-8')
-                            for i in range(0, len(response_bytes), chunk_size):
-                                chunk = response_bytes[i:i + chunk_size]
-                                client.sendall(chunk)
-                            log_message("Response sent successfully")
-                        except Exception as e:
-                            log_message("Error executing command: {0}".format(str(e)))
-                            traceback.print_exc()
-                            error_response = {
-                                "status": "error",
-                                "message": str(e)
-                            }
-                            try:
-                                client.sendall(json.dumps(error_response).encode('utf-8'))
-                            except Exception as e:
-                                log_message("Failed to send error response: {0}".format(str(e)))
-                                return False  # Signal connection should be closed
-                        return True  # Signal connection should stay open
-                    
-                    # Use RhinoApp.Idle event for IronPython 2.7 compatibility
-                    def idle_handler(sender, e):
-                        if not execute_wrapper():
-                            # If execute_wrapper returns False, close the connection
-                            try:
-                                client.close()
-                            except:
-                                pass
-                        # Remove the handler after execution
-                        Rhino.RhinoApp.Idle -= idle_handler
-                    
-                    Rhino.RhinoApp.Idle += idle_handler
-                    
-                except ValueError as e:
-                    # Handle JSON decode error (IronPython 2.7)
-                    log_message("Invalid JSON received: {0}".format(str(e)))
-                    error_response = {
-                        "status": "error",
-                        "message": "Invalid JSON format"
-                    }
+                async for message in websocket:
                     try:
-                        client.sendall(json.dumps(error_response).encode('utf-8'))
-                    except:
-                        break  # Close connection on send error
-                
-        except Exception as e:
-            log_message("Error handling client: {0}".format(str(e)))
-            traceback.print_exc()
-        finally:
-            try:
-                client.close()
-            except:
-                pass
+                        command = json.loads(message)
+                        log_message("Received command: {0}".format(command))
+                        
+                        # Execute command and get response
+                        response = self.execute_command(command)
+                        response_json = json.dumps(response)
+                        
+                        # Send response
+                        await websocket.send(response_json)
+                        log_message("Response sent successfully")
+                        
+                    except json.JSONDecodeError as e:
+                        log_message("Invalid JSON received: {0}".format(str(e)))
+                        error_response = {
+                            "status": "error",
+                            "message": "Invalid JSON format"
+                        }
+                        await websocket.send(json.dumps(error_response))
+                        
+            except websockets.exceptions.ConnectionClosed:
+                log_message("Client disconnected")
+            except Exception as e:
+                log_message("Error handling client: {0}".format(str(e)))
+                traceback.print_exc()
+        
+        async def start_server():
+            self.server = await websockets.serve(
+                handle_client,
+                self.host,
+                self.port
+            )
+            await self.server.wait_closed()
+        
+        # Run the server
+        asyncio.run(start_server())
     
     def execute_command(self, command):
         """Execute a command received from the client"""
